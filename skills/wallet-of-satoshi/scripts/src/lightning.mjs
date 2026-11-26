@@ -82,6 +82,15 @@ export async function invoiceFromAddress(address, sats) {
   }
 
   const callback = new URL(payee.callback);
+  // The invoice is fetched from the callback, so whoever runs the callback decides who gets paid.
+  // If it is not the address's own host, the typed address proves nothing about the payee; refuse it.
+  // (A provider that legitimately splits the two hosts can relax this, e.g. by checking the invoice's
+  // description_hash against the payee document's metadata.)
+  const payeeHost = new URL(lightningAddressUrl(address)).hostname;
+  if (callback.hostname !== payeeHost) {
+    throw new SkillError('ADDRESS_REFUSED',
+      `The address points its callback at ${callback.hostname}, so the invoice would pay a different server`);
+  }
   callback.searchParams.set('amount', String(msat));
   const invoice = (await getJson(callback.toString())).pr;
   if (typeof invoice !== 'string' || invoiceAmountMsat(invoice) !== BigInt(msat)) {

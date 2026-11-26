@@ -1,6 +1,39 @@
 // Lightning invoices and Lightning Addresses, as far as the skill needs to understand them.
 
+import { createHash } from 'node:crypto';
+
 import { SkillError } from './errors.mjs';
+
+const BECH32 = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+
+/**
+ * The description hash (BOLT11 field tag 23) an invoice carries, as hex, or null when it has none.
+ * Only the field is parsed; signature and checksum are not validated here.
+ */
+export function invoiceDescriptionHash(invoice) {
+  const text = String(invoice || '').toLowerCase();
+  const separator = text.lastIndexOf('1');
+  if (separator < 1) return null;
+  const data = [...text.slice(separator + 1)].map(ch => BECH32.indexOf(ch));
+  if (data.includes(-1)) return null;
+  const words = data.slice(0, -6); // trailing 6 words are the checksum
+  let i = 7; // 35-bit timestamp
+  while (i + 3 <= words.length) {
+    const tag = words[i];
+    const length = words[i + 1] * 32 + words[i + 2];
+    i += 3;
+    const value = words.slice(i, i + length);
+    i += length;
+    if (tag === 23 && length === 52) {
+      let bits = '';
+      for (const word of value) bits += word.toString(2).padStart(5, '0');
+      let hex = '';
+      for (let b = 0; b < 32; b += 1) hex += parseInt(bits.slice(b * 8, b * 8 + 8), 2).toString(16).padStart(2, '0');
+      return hex;
+    }
+  }
+  return null;
+}
 
 const LOOKUP_TIMEOUT_MS = 20_000;
 const MSAT_PER_UNIT = {'': 100_000_000_000n, m: 100_000_000n, u: 100_000n, n: 100n};
@@ -81,20 +114,24 @@ export async function invoiceFromAddress(address, sats) {
     throw new SkillError('AMOUNT_OUT_OF_RANGE', `That address accepts ${Math.ceil(min / 1000)} to ${Math.floor(max / 1000)} sats`);
   }
 
-  const callback = new URL(payee.callback);
-  // The invoice is fetched from the callback, so whoever runs the callback decides who gets paid.
-  // If it is not the address's own host, the typed address proves nothing about the payee; refuse it.
-  // (A provider that legitimately splits the two hosts can relax this, e.g. by checking the invoice's
-  // description_hash against the payee document's metadata.)
-  const payeeHost = new URL(lightningAddressUrl(address)).hostname;
-  if (callback.hostname !== payeeHost) {
-    throw new SkillError('ADDRESS_REFUSED',
-      `The address points its callback at ${callback.hostname}, so the invoice would pay a different server`);
+  // LUD-06: the invoice must carry sha256(metadata) as its description hash. Without that binding the
+  // callback (possibly on another host, possibly after a redirect) decides who is paid and the typed
+  // address proves nothing about the payee.
+  const metadata = typeof payee.metadata === 'string' ? payee.metadata : '';
+  if (!metadata) {
+    throw new SkillError('ADDRESS_REFUSED', 'That address serves no metadata, so the invoice cannot be tied to it');
   }
+  const callback = new URL(payee.callback);
   callback.searchParams.set('amount', String(msat));
   const invoice = (await getJson(callback.toString())).pr;
   if (typeof invoice !== 'string' || invoiceAmountMsat(invoice) !== BigInt(msat)) {
     throw new SkillError('ADDRESS_REFUSED', 'The payee returned an invoice for a different amount, so it was not sent to the owner');
+  }
+  const expectedHash = createHash('sha256').update(metadata).digest('hex');
+  const gotHash = invoiceDescriptionHash(invoice);
+  if (gotHash !== expectedHash) {
+    throw new SkillError('ADDRESS_REFUSED',
+      `The invoice is not bound to the address it was requested for (description hash ${gotHash ? 'mismatch' : 'missing'})`);
   }
   return invoice;
 }
